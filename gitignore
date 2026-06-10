@@ -1,0 +1,43 @@
+# ----- Python -----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ----- Virtual environments -----
+.venv/
+venv/
+env/
+ENV/
+
+# ----- PyInstaller build artifacts -----
+build/
+dist/
+*.manifest
+*.spec.bak
+
+# ----- App runtime files -----
+# Auto-generated per-user settings (don't commit personal config)
+air_control_settings.json
+
+# ----- Jupyter -----
+.ipynb_checkpoints/
+
+# ----- OS junk -----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ----- IDE / editor -----
+.vscode/
+.idea/
+*.swp
+
+# ----- Logs / temp -----
+*.log
+*.tmp
+
+# ----- Optional: large model binaries -----
+# Uncomment the next line if you prefer NOT to commit the trained model
+# and instead regenerate it from Phase8_Training_OpenML.ipynb
+# *.joblib
