@@ -49,6 +49,10 @@ DEFAULTS = {
     "pen_thickness": 14,
     "game_gas": "right",
     "game_brake": "left",
+    "game_left": "a",
+    "game_right": "d",
+    "game_enabled": {"gas": True, "brake": True, "left": False, "right": False},
+    "swing_sensitivity": 0.08,
     "gestures": {
         "click": "index_thumb",
         "drag": "middle_curl",
@@ -72,8 +76,8 @@ class Settings:
                 with open(self.path) as f:
                     loaded = json.load(f)
                 for k, v in loaded.items():
-                    if k == "gestures" and isinstance(v, dict):
-                        self.data["gestures"].update(v)
+                    if k in ("gestures", "game_enabled") and isinstance(v, dict):
+                        self.data[k].update(v)
                     else:
                         self.data[k] = v
         except Exception:
@@ -87,7 +91,21 @@ class Settings:
             pass
 
 def fingers_up(lm):
-    f = [1 if lm[THUMB_TIP].x < lm[THUMB_TIP - 1].x else 0]
+    # Thumb: compare the thumb tip to the thumb's lower joint along x, but the
+    # direction depends on which hand it is. A left hand's thumb points the
+    # opposite way to a right hand's, so a fixed '<' test fails for one of them
+    # (this is why left-hand open-palm used to read as only 4 fingers).
+    # We infer the hand's orientation from the wrist-vs-pinky direction and
+    # flip the comparison accordingly, so an open palm reads as 5 for BOTH hands.
+    thumb_tip_x = lm[THUMB_TIP].x
+    thumb_ip_x = lm[THUMB_TIP - 1].x
+    # if the pinky MCP is to the right of the index MCP, the hand is oriented
+    # one way; otherwise the other. Use that to pick the thumb test direction.
+    if lm[17].x < lm[5].x:        # pinky-side left of index-side
+        thumb = 1 if thumb_tip_x > thumb_ip_x else 0
+    else:
+        thumb = 1 if thumb_tip_x < thumb_ip_x else 0
+    f = [thumb]
     for tip, pip in zip(TIPS[1:], PIPS[1:]):
         f.append(1 if lm[tip].y < lm[pip].y else 0)
     return f
@@ -137,7 +155,9 @@ class Worker(QtCore.QThread):
         self.cooldown = 0
         self.model = None
         self.label_map = None
-        self.game_key = None        # which key is currently held down (gas/brake)
+        self.game_keys = set()      # keys currently held down (racing: up to 4)
+        self.prev_wrist_y = None     # for cricket swing detection
+        self.swing_cooldown = 0
 
     def set_mode(self, mode):
         with self._lock:
@@ -151,10 +171,13 @@ class Worker(QtCore.QThread):
                 except Exception: pass
             self.dragging = False
             # release any held game key so it never gets stuck when leaving Game
-            if self.game_key is not None:
-                try: pyautogui.keyUp(self.game_key)
+            # release any held game keys so none get stuck when leaving Game
+            for k in list(self.game_keys):
+                try: pyautogui.keyUp(k)
                 except Exception: pass
-            self.game_key = None
+            self.game_keys = set()
+            self.prev_wrist_y = None
+            self.swing_cooldown = 0
             self.prev_pt = None
             self.prev_screen_pt = None
             self.prev_scroll = None
@@ -211,10 +234,26 @@ class Worker(QtCore.QThread):
         cap = (cv2.VideoCapture(0, cv2.CAP_DSHOW) if platform.system()=="Windows"
                else cv2.VideoCapture(0))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640); cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        hands = mp.solutions.hands.Hands(static_image_mode=False, max_num_hands=1,
+        # Keep only the newest frame in the camera buffer. Without this, slow
+        # processing (especially Pose in cricket mode) lets frames pile up in
+        # OpenCV's internal queue, so we'd process seconds-old frames -> big lag.
+        try: cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception: pass
+        hands = mp.solutions.hands.Hands(static_image_mode=False, max_num_hands=2,
                                          min_detection_confidence=0.7, min_tracking_confidence=0.5)
+        pose = mp.solutions.pose.Pose(static_image_mode=False,
+                                      model_complexity=0,   # fastest - good for motion
+                                      min_detection_confidence=0.6,
+                                      min_tracking_confidence=0.5)
         du = mp.solutions.drawing_utils
         while self.running:
+            with self._lock: mode_peek = self.mode
+            # In cricket mode, Pose is heavy and frames back up in the camera
+            # buffer, causing seconds of lag. Drain to the freshest frame by
+            # grabbing (cheaply) a few times before the real read+decode.
+            if mode_peek == "cricket":
+                for _ in range(4):
+                    cap.grab()
             ok, frame = cap.read()
             if not ok: continue
             frame = cv2.flip(frame, 1)
@@ -222,11 +261,53 @@ class Worker(QtCore.QThread):
             if self.canvas is None: self.canvas = np.zeros((h,w),np.uint8)
             if self.screen_canvas is None:
                 self.screen_canvas = np.zeros((SCREEN_H, SCREEN_W), np.uint8)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            rgb.flags.writeable=False; res=hands.process(rgb); rgb.flags.writeable=True
             with self._lock: mode = self.mode
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb.flags.writeable=False
+
+            if mode == "cricket":
+                # Cricket uses full-body Pose, not Hands.
+                pres = pose.process(rgb); rgb.flags.writeable=True
+                status = "Cricket"
+                if pres.pose_landmarks:
+                    du.draw_landmarks(frame, pres.pose_landmarks,
+                                      mp.solutions.pose.POSE_CONNECTIONS)
+                    try:
+                        status = self._do_cricket(pres.pose_landmarks.landmark)
+                    except Exception as e:
+                        status = "error: "+str(e)[:40]
+                # skip the hand pipeline this frame
+                self._emit_frame(frame, w, h); self.status_ready.emit(status)
+                if self.cooldown>0: self.cooldown-=1
+                continue
+
+            res=hands.process(rgb); rgb.flags.writeable=True
             status = "Idle" if mode is None else mode.title()
-            if res.multi_hand_landmarks and mode is not None:
+            if mode == "game":
+                # Game (racing) mode uses BOTH hands: one steers, one pedals.
+                # We decide which hand is which by SCREEN POSITION, not MediaPipe's
+                # Left/Right label - the label is unreliable here because we mirror
+                # the frame (cv2.flip), which inverts it. Position is bulletproof:
+                # the hand further right on screen is the right (pedals) hand.
+                hands_lm = []
+                if res.multi_hand_landmarks:
+                    detected = []
+                    for hlm in res.multi_hand_landmarks:
+                        du.draw_landmarks(frame, hlm, mp.solutions.hands.HAND_CONNECTIONS)
+                        # use wrist x-position to place the hand on screen
+                        detected.append((hlm.landmark[WRIST].x, hlm.landmark))
+                    detected.sort(key=lambda d: d[0])     # left-most first
+                    if len(detected) == 1:
+                        # one hand only: treat as the pedals (Right) hand
+                        hands_lm.append(("Right", detected[0][1]))
+                    elif len(detected) >= 2:
+                        hands_lm.append(("Left",  detected[0][1]))   # left side of screen
+                        hands_lm.append(("Right", detected[-1][1]))  # right side of screen
+                try:
+                    status = self._do_game(hands_lm)
+                except Exception as e:
+                    status = "error: "+str(e)[:40]
+            elif res.multi_hand_landmarks and mode is not None:
                 hand = res.multi_hand_landmarks[0]
                 du.draw_landmarks(frame, hand, mp.solutions.hands.HAND_CONNECTIONS)
                 lm = hand.landmark
@@ -234,14 +315,8 @@ class Worker(QtCore.QThread):
                     if mode=="mouse":   status=self._do_mouse(lm)
                     elif mode=="canvas": status=self._do_canvas(lm,w,h)
                     elif mode=="writing": status=self._do_writing(lm,w,h)
-                    elif mode=="game": status=self._do_game(lm)
                 except Exception as e:
                     status = "error: "+str(e)[:40]
-            elif mode == "game" and self.game_key is not None:
-                # no hand visible in Game mode -> release so the car coasts
-                try: pyautogui.keyUp(self.game_key)
-                except Exception: pass
-                self.game_key = None
             if mode in ("canvas","writing") and self.canvas is not None:
                 col = cv2.cvtColor(self.canvas, cv2.COLOR_GRAY2BGR); col[:,:,0]=0
                 frame = cv2.addWeighted(frame,1.0,col,0.8,0)
@@ -265,7 +340,12 @@ class Worker(QtCore.QThread):
             qimg = QtGui.QImage(disp.data,w,h,3*w,QtGui.QImage.Format_RGB888).copy()
             self.frame_ready.emit(qimg); self.status_ready.emit(status)
             if self.cooldown>0: self.cooldown-=1
-        cap.release(); hands.close()
+        cap.release(); hands.close(); pose.close()
+
+    def _emit_frame(self, frame, w, h):
+        disp = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        qimg = QtGui.QImage(disp.data, w, h, 3*w, QtGui.QImage.Format_RGB888).copy()
+        self.frame_ready.emit(qimg)
 
     def _do_mouse(self, lm):
         g = self.settings.data["gestures"]
@@ -352,38 +432,107 @@ class Worker(QtCore.QThread):
             return "Writing: drawing"
         self.prev_pt=None; self.prev_screen_pt=None; return "Writing: pen up"
 
-    def _do_game(self, lm):
-        """Hill Climb Racing control: open palm = hold gas, fist = hold brake,
-        anything else = coast (release). Keys are held across frames and only
-        changed when the desired key changes - so the car drives smoothly and
-        the key never gets stuck."""
-        f = fingers_up(lm); total = sum(f)
-        gas_key = self.settings.data.get("game_gas", "right")
-        brake_key = self.settings.data.get("game_brake", "left")
+    def _do_game(self, hands_lm):
+        """Two-hand racing control.
+          Right hand: open palm = GAS, fist = BRAKE   (pedals)
+          Left hand:  open palm = RIGHT, fist = LEFT   (steering)
+        Each of the four controls (gas/brake/left/right) has an enable checkbox;
+        only enabled controls can fire. Because each hand is read independently,
+        you can hold gas AND steer at the same time (real racing combos).
 
-        if total == 5:        desired = gas_key      # open palm -> accelerate
-        elif total == 0:      desired = brake_key    # fist -> brake / reverse
-        else:                 desired = None         # coast
+        We compute the SET of keys that should be held this frame, then sync the
+        actually-held keys to match - pressing newly-needed keys and releasing
+        ones no longer needed. This makes combos smooth and prevents stuck keys.
+        """
+        en = self.settings.data.get("game_enabled",
+                                    {"gas": True, "brake": True, "left": False, "right": False})
+        keymap = {
+            "gas":   self.settings.data.get("game_gas", "right"),
+            "brake": self.settings.data.get("game_brake", "left"),
+            "left":  self.settings.data.get("game_left", "a"),
+            "right": self.settings.data.get("game_right", "d"),
+        }
 
-        if desired != self.game_key:
-            # release the old key, press the new one (only on change)
-            if self.game_key is not None:
-                try: pyautogui.keyUp(self.game_key)
+        desired = set()
+        labels = []
+        seen = []
+        for label, lm in hands_lm:
+            f = fingers_up(lm); total = sum(f)
+            four = sum(f[1:])   # index..pinky only - the thumb is unreliable,
+                                # especially in a fist, so judge palm/fist on the
+                                # four main fingers (all up = palm, all down = fist)
+            shape = "palm" if four == 4 else ("fist" if four == 0 else None)
+            # two-finger gesture: index + middle up, ring + pinky down
+            two_fingers = (f[1] == 1 and f[2] == 1 and f[3] == 0 and f[4] == 0)
+            seen.append(label[0])   # 'L' or 'R' for the status line
+
+            if label == "Right":           # pedals hand: palm=gas, fist=brake
+                if shape == "palm" and en.get("gas"):
+                    desired.add(keymap["gas"]); labels.append("GAS")
+                elif shape == "fist" and en.get("brake"):
+                    desired.add(keymap["brake"]); labels.append("BRAKE")
+            else:                          # left hand -> steering
+                # two fingers = steer RIGHT, fist = steer LEFT, palm = neutral
+                if two_fingers and en.get("right"):
+                    desired.add(keymap["right"]); labels.append("RIGHT(2-finger)")
+                elif shape == "fist" and en.get("left"):
+                    desired.add(keymap["left"]); labels.append("LEFT(fist)")
+                # palm (or anything else) = neutral: add nothing -> steering releases
+
+        # sync held keys to the desired set
+        for k in desired - self.game_keys:        # newly needed -> press
+            try: pyautogui.keyDown(k)
+            except Exception: pass
+        for k in self.game_keys - desired:        # no longer needed -> release
+            try: pyautogui.keyUp(k)
+            except Exception: pass
+        self.game_keys = desired
+
+        # status shows hands seen (L/R) + active controls, to make debugging easy
+        hands_txt = "".join(sorted(seen)) or "-"
+        steer_on = en.get("left") or en.get("right")
+        act = " + ".join(labels) if labels else "coast"
+        warn = "" if steer_on else "  (steering OFF - tick Left/Right)"
+        return f"Game [{hands_txt}]: {act}{warn}"
+
+    def _do_cricket(self, plm):
+        """Detect a downward bat-swing from full-body pose and fire a click.
+        Tracks the higher (more raised) wrist; when it drops fast, that's a
+        swing -> one click. A cooldown ensures one swing = one shot, not a
+        burst of clicks."""
+        LW, RW = 15, 16          # left/right wrist landmark indices
+        # use whichever wrist is higher on screen (smaller y = higher up),
+        # i.e. the raised batting arm
+        lw, rw = plm[LW], plm[RW]
+        wrist = lw if lw.y < rw.y else rw
+        # ignore low-visibility detections to avoid false swings
+        if getattr(wrist, "visibility", 1.0) < 0.5:
+            self.prev_wrist_y = None
+            return "Cricket: show your body"
+
+        y = wrist.y
+        status = "Cricket: ready"
+        if self.swing_cooldown > 0:
+            self.swing_cooldown -= 1
+            status = "Cricket: ..."
+
+        if self.prev_wrist_y is not None and self.swing_cooldown == 0:
+            dy = y - self.prev_wrist_y          # positive = wrist moved DOWN
+            # a fast downward drop = a bat swing. threshold is fraction of frame
+            # height per frame; tuned so a deliberate swing triggers, idle doesn't
+            if dy > self.settings.data.get("swing_sensitivity", 0.08):
+                try: pyautogui.click()
                 except Exception: pass
-            if desired is not None:
-                try: pyautogui.keyDown(desired)
-                except Exception: pass
-            self.game_key = desired
-
-        if desired == gas_key:   return "Game: GAS"
-        if desired == brake_key: return "Game: BRAKE"
-        return "Game: coast"
+                self.swing_cooldown = 12         # ~ block re-fire for a moment
+                status = "Cricket: SHOT!"
+        self.prev_wrist_y = y
+        return status
 
     def stop(self):
-        if self.game_key is not None:
-            try: pyautogui.keyUp(self.game_key)
+        for k in list(self.game_keys):
+            try: pyautogui.keyUp(k)
             except Exception: pass
-            self.game_key = None
+        self.game_keys = set()
         self.running=False; self.wait(1000)
 
 DARK_QSS = """
@@ -406,6 +555,12 @@ QComboBox:hover { border-color:#33333f; }
 QLineEdit { background:#15151d; border:1px solid #24242f; border-radius:8px;
             padding:6px 8px; color:#cfcfe0; }
 QLineEdit:focus { border-color:#00c2ff; }
+QCheckBox { spacing:6px; }
+QCheckBox::indicator { width:18px; height:18px; border:1px solid #2a2a3a;
+            border-radius:5px; background:#15151d; }
+QCheckBox::indicator:checked { background:#00c2ff; border-color:#00c2ff; }
+QGridLayout { }
+QFormLayout { }
 QComboBox QAbstractItemView { background:#15151d; color:#cfcfe0;
             selection-background-color:#00c2ff; selection-color:#08080c;
             border:1px solid #24242f; outline:none; }
@@ -531,35 +686,50 @@ class AirControl(QtWidgets.QWidget):
         self.setStyleSheet(DARK_QSS)
 
     def _build_ui(self):
-        root = QtWidgets.QVBoxLayout(self)
+        # Outer layout holds a scroll area so the many control panels never
+        # cram together - the window can be any height and the content scrolls.
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        content = QtWidgets.QWidget()
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+
+        root = QtWidgets.QVBoxLayout(content)
         root.setContentsMargins(20, 18, 20, 16)
         root.setSpacing(12)
         title = QtWidgets.QLabel("Air Control"); title.setObjectName("title")
         root.addWidget(title)
-        subtitle = QtWidgets.QLabel("Touchless control \u2014 mouse, canvas, writing")
+        subtitle = QtWidgets.QLabel("Touchless control \u2014 mouse, canvas, writing, games")
         subtitle.setObjectName("subtitle")
         root.addWidget(subtitle)
 
         # collapsible preview
         self.preview = QtWidgets.QLabel("camera starting...")
         self.preview.setObjectName("preview")
-        self.preview.setMinimumHeight(240)
+        self.preview.setFixedHeight(260)   # fixed: it lives in a scroll area now
         self.preview.setAlignment(QtCore.Qt.AlignCenter)
-        root.addWidget(self.preview, 1)
+        root.addWidget(self.preview)       # no stretch factor inside the scroll area
         self.preview_toggle = QtWidgets.QPushButton("Hide camera preview")
         self.preview_toggle.setCursor(QtCore.Qt.PointingHandCursor)
         self.preview_toggle.clicked.connect(self.toggle_preview)
         root.addWidget(self.preview_toggle)
 
         # feature buttons
-        feat = QtWidgets.QHBoxLayout()
+        feat = QtWidgets.QGridLayout()
         feat.setSpacing(8)
         self.buttons = {}
-        for key,label in [("mouse","Mouse"),("canvas","Canvas"),("writing","Writing"),("game","Game")]:
+        feats = [("mouse","Mouse"),("canvas","Canvas"),("writing","Writing"),
+                 ("game","Game"),("cricket","Cricket")]
+        for i,(key,label) in enumerate(feats):
             b=QtWidgets.QPushButton(label); b.setCheckable(True); b.setMinimumHeight(46)
             b.setCursor(QtCore.Qt.PointingHandCursor)
             b.clicked.connect(lambda _,k=key:self.toggle(k))
-            feat.addWidget(b); self.buttons[key]=b
+            feat.addWidget(b, i // 3, i % 3)   # 3 per row, wraps to next
+            self.buttons[key]=b
         root.addLayout(feat)
 
         self.stop_btn=QtWidgets.QPushButton("Stop All"); self.stop_btn.setObjectName("stop")
@@ -569,6 +739,9 @@ class AirControl(QtWidgets.QWidget):
 
         # settings sliders
         sg = QtWidgets.QGroupBox("Settings"); sgl=QtWidgets.QFormLayout(sg)
+        sgl.setVerticalSpacing(10); sgl.setHorizontalSpacing(12)
+        sgl.setContentsMargins(12, 8, 12, 8)
+        sgl.setLabelAlignment(QtCore.Qt.AlignRight)
         self.sliders={}
         def add_slider(key,lo,hi,scale,label):
             s=QtWidgets.QSlider(QtCore.Qt.Horizontal); s.setMinimum(lo); s.setMaximum(hi)
@@ -585,10 +758,14 @@ class AirControl(QtWidgets.QWidget):
         add_slider("click_on",8,40,100,"Click sensitivity")
         add_slider("scroll_speed",4,40,1,"Scroll speed")
         add_slider("pen_thickness",4,30,1,"Pen thickness")
+        add_slider("swing_sensitivity",3,20,100,"Swing sensitivity")
         root.addWidget(sg)
 
         # gesture remap
         rg=QtWidgets.QGroupBox("Gesture mapping"); rgl=QtWidgets.QFormLayout(rg)
+        rgl.setVerticalSpacing(10); rgl.setHorizontalSpacing(12)
+        rgl.setContentsMargins(12, 8, 12, 8)
+        rgl.setLabelAlignment(QtCore.Qt.AlignRight)
         self.combos={}
         for action in ["click","drag","scroll","recognize","clear"]:
             c=QtWidgets.QComboBox(); c.addItems(GESTURE_CHOICES)
@@ -598,18 +775,43 @@ class AirControl(QtWidgets.QWidget):
         root.addWidget(rg)
 
         # game keys - type which key palm (gas) and fist (brake) should press,
-        # so Game mode works with any two-key game
-        gk = QtWidgets.QGroupBox("Game keys"); gkl = QtWidgets.QFormLayout(gk)
-        self.gas_edit = QtWidgets.QLineEdit(str(self.settings.data.get("game_gas","right")))
-        self.brake_edit = QtWidgets.QLineEdit(str(self.settings.data.get("game_brake","left")))
-        for edit, key in ((self.gas_edit,"game_gas"), (self.brake_edit,"game_brake")):
-            edit.setMaxLength(12)
-            edit.textChanged.connect(lambda val,k=key: self.set_game_key(k, val))
-        gkl.addRow("Palm \u2192 gas key", self.gas_edit)
-        gkl.addRow("Fist \u2192 brake key", self.brake_edit)
-        hint = QtWidgets.QLabel("e.g. right / left, or d / a, or space, up, w")
-        hint.setObjectName("status")
-        gkl.addRow(hint)
+        # Racing controls: enable any of the four, set each key. Right hand =
+        # pedals (gas/brake), left hand = steering (left/right). Tick only the
+        # ones a game needs (e.g. gas+brake for Hill Climb, all four for racing).
+        gk = QtWidgets.QGroupBox("Game / racing controls")
+        gkl = QtWidgets.QGridLayout(gk)
+        gkl.setVerticalSpacing(10); gkl.setHorizontalSpacing(12)
+        gkl.setContentsMargins(12, 8, 12, 8)
+        gkl.setColumnStretch(1, 1)   # let the label column take the slack
+        gkl.addWidget(QtWidgets.QLabel("Use"), 0, 0)
+        gkl.addWidget(QtWidgets.QLabel("Control"), 0, 1)
+        gkl.addWidget(QtWidgets.QLabel("Key"), 0, 2)
+
+        self.game_checks = {}
+        self.game_edits = {}
+        rows = [
+            ("gas",   "Right hand palm \u2192 Gas",   "game_gas"),
+            ("brake", "Right hand fist \u2192 Brake", "game_brake"),
+            ("right", "Left hand palm \u2192 Right",  "game_right"),
+            ("left",  "Left hand fist \u2192 Left",   "game_left"),
+        ]
+        for r, (ctrl, label, skey) in enumerate(rows, start=1):
+            cb = QtWidgets.QCheckBox()
+            cb.setChecked(bool(self.settings.data.get("game_enabled", {}).get(ctrl, False)))
+            cb.setCursor(QtCore.Qt.PointingHandCursor)
+            cb.toggled.connect(lambda on, c=ctrl: self.set_game_enabled(c, on))
+            ed = QtWidgets.QLineEdit(str(self.settings.data.get(skey, "")))
+            ed.setMaxLength(12)
+            ed.textChanged.connect(lambda val, k=skey: self.set_game_key(k, val))
+            gkl.addWidget(cb, r, 0)
+            gkl.addWidget(QtWidgets.QLabel(label), r, 1)
+            gkl.addWidget(ed, r, 2)
+            self.game_checks[ctrl] = cb
+            self.game_edits[skey] = ed
+        hint = QtWidgets.QLabel("Tick the controls your game needs. Keys: a, d, "
+                                "left, right, up, space, w \u2026")
+        hint.setObjectName("status"); hint.setWordWrap(True)
+        gkl.addWidget(hint, len(rows)+1, 0, 1, 3)
         root.addWidget(gk)
 
         self.status=QtWidgets.QLabel("Status: idle"); self.status.setObjectName("status")
@@ -630,6 +832,10 @@ class AirControl(QtWidgets.QWidget):
 
     def remap(self, action, value):
         self.settings.data["gestures"][action]=value; self.settings.save()
+
+    def set_game_enabled(self, control, on):
+        self.settings.data.setdefault("game_enabled", {})[control] = bool(on)
+        self.settings.save()
 
     def set_game_key(self, key, value):
         # store the typed key, lowercased and trimmed; ignore empty so we never
@@ -672,7 +878,9 @@ class AirControl(QtWidgets.QWidget):
     @QtCore.pyqtSlot(QtGui.QImage)
     def on_frame(self, qimg):
         if not self.preview.isVisible(): return
-        pix=QtGui.QPixmap.fromImage(qimg).scaled(self.preview.width(),self.preview.height(),
+        pw = self.preview.width() or 400
+        ph = self.preview.height() or 260
+        pix=QtGui.QPixmap.fromImage(qimg).scaled(pw, ph,
             QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
         self.preview.setPixmap(pix)
 
@@ -688,3 +896,4 @@ def main():
 
 if __name__=="__main__":
     main()
+
