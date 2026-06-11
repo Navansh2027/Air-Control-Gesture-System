@@ -8,29 +8,37 @@ or trackpad.
 Built in Python with MediaPipe (hand & body tracking), OpenCV (camera), PyQt5
 (GUI), PyAutoGUI (input control), and scikit-learn (handwriting recognition).
 
----
-
 ## Features
 
 The app runs as a single sleek dark desktop window with a live camera preview.
 One feature is active at a time; you switch between them with on-screen buttons.
 
-- **Touchless Mouse** — move the cursor with your index finger; pinch to click,
-  pinch with the middle finger curled to drag, two fingers to scroll.
-- **Air Canvas** — a transparent full-screen overlay you draw on with your index
-  finger, over your desktop or any app; make a fist to clear.
-- **Air Writing** — write characters in the air on the full-screen overlay; they
-  are recognised and typed into whatever app has focus. Open palm confirms a
-  character, pinch adds a space, two fingers backspace, fist clears.
-- **Game** — control any two-key game with gestures: open palm holds one key,
-  fist holds another. The keys are configurable, so it works with any simple
-  game (e.g. Hill Climb Racing — palm to accelerate, fist to brake).
-- **Cricket** — full-body mode: stand back and swing your arm down to bat in
-  simple browser cricket games (the swing sends a click to hit the ball).
+### Touchless Mouse
+Move the cursor with your index finger; pinch to click, pinch with the middle
+finger curled to drag, two fingers to scroll.
+
+### Air Canvas
+A transparent full-screen overlay you draw on with your index finger, over your
+desktop or any app; make a fist to clear. Press Esc to exit.
+
+### Air Writing
+Write characters in the air on the full-screen overlay; they are recognised and
+typed into whatever app has focus. Open palm confirms a character, pinch adds a
+space, two fingers backspace, fist clears.
+
+### Game (two-hand control)
+Control games with gestures. Right hand = pedals (palm = gas, fist = brake),
+left hand = steering (two fingers = right, fist = left, palm = neutral). Each of
+the four controls has an enable checkbox and a configurable key, so it works
+with any simple game — e.g. Hill Climb Racing or a browser racer.
+
+### Cricket (full-body)
+Stand back and swing your arm down to bat in simple browser cricket games (the
+swing sends a click to hit the ball). Uses full-body pose tracking.
 
 Settings — smoothing, click sensitivity, scroll speed, pen thickness, swing
-sensitivity, configurable game keys, and remappable gestures — are adjustable
-with live controls and persist between sessions.
+sensitivity, configurable game keys/controls, and remappable gestures — are
+adjustable with live controls and persist between sessions.
 
 ---
 
@@ -96,8 +104,44 @@ The project was developed in stages, each captured as a Jupyter notebook:
 | `Phase8_SentenceWriting.ipynb` | Letter + digit recognition, sentence building |
 | `Phase8_Training_OpenML.ipynb` | Trains the character model (`char_model.joblib`) |
 
-`air_control.py` unifies all of the above into one application, and adds the
-Game (two-key gesture control) and Cricket (full-body swing) modes.
+`air_control.py` unifies all of the above into one application.
+
+---
+
+## Changelog
+
+Grouped by what each update added. (Add real dates if you'd like — these are in
+the order features were built.)
+
+### Update 5 — Cricket polish & racing fixes
+- Reduced cricket-mode lag by clearing the camera buffer and draining stale
+  frames (the swing now registers far closer to real time).
+- Left-hand steering remapped: two fingers = right, fist = left, palm = neutral.
+- Status line shows which hands are detected and the active controls.
+
+### Update 4 — Two-hand racing
+- Game mode now tracks **both hands**: one steers, one pedals, so you can hold
+  gas and steer at the same time (real combos).
+- Four independent controls (gas, brake, left, right), each with an enable
+  checkbox and a configurable key.
+- UI reorganised with a scroll area and proper spacing so panels never overlap.
+
+### Update 3 — Game & Cricket modes
+- Added **Game** mode: palm/fist hold configurable keys to control simple
+  two-key games (e.g. Hill Climb Racing).
+- Added **Cricket** mode: full-body pose tracking detects a downward arm swing
+  and fires a click to bat in simple browser cricket games.
+
+### Update 2 — Transparent overlay & UI refresh
+- Air Canvas / Air Writing now draw on a **transparent full-screen overlay** over
+  the desktop, instead of a black window.
+- Fixed Air Writing disabling itself (the overlay no longer steals keyboard
+  focus, so typed characters reach the real target app).
+- Sleek dark theme and refined layout.
+
+### Update 1 — Core app
+- Unified Mouse, Canvas, and Writing into one PyQt5 app with a live preview,
+  adjustable settings, remappable gestures, and persistent configuration.
 
 ---
 
@@ -113,6 +157,10 @@ Game (two-key gesture control) and Cricket (full-body swing) modes.
   one model at a time to stay light.
 - **Latency** — gesture and especially body-tracking modes add some delay from
   the camera-to-action pipeline, so fast-reaction games feel best when forgiving.
+- **Why gesture control suits simple games** — body gestures are a low-bandwidth
+  input (a few clear signals at a time), so they fit games needing few, forgiving
+  inputs (Hill Climb, Doodle Cricket) and not games needing many precise
+  simultaneous inputs (full cricket sims).
 
 ## License
 
